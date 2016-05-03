@@ -279,3 +279,20 @@ class DistributedConsulAgent(SessionedConsulAgent):
                 # handle consul lock-delay safe guard, retry a bit later
                 reactor.callLater(self.ELECTION_RETRY, self.acquire_leadership)
             self.logger.trace('name=%s session=%s acquired_leadership=%s', self.name, self.session, self.is_leader)
+
+    @defer.inlineCallbacks
+    def wait_for_leader(self, attempts=None, interval=None):
+        """
+        :param attempts: number of attempts before giving up, if None there is
+            no giving up.
+        :type attempts: int or None
+        :param interval: interval (in seconds), by default the election retry interval is used
+        :type interval: int or None
+        """
+        yield self.wait_for_ready()
+        interval = interval if interval is not None else self.ELECTION_RETRY
+        attempt = 0
+        while self.leader is None and (attempts is None or attempt <= attempts):
+            attempt += 1
+            self.logger.debug('attempt=%s interval=%ss waiting for leader to be elected', attempt, interval)
+            yield async_sleep(interval)
