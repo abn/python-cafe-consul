@@ -3,7 +3,6 @@ from twisted.internet import defer, reactor, task
 
 from cafe.logging import LoggedObject
 from cafe.twisted import async_sleep
-from consul import Consul as ConsulSynchronous
 from consul.base import ConsulException
 from consul.twisted import Consul
 
@@ -16,82 +15,78 @@ CONSUL_VERIFY = bool(getenv('CONSUL_VERIFY', 'True'))
 
 
 class SessionedConsulAgent(LoggedObject, object):
-    SESSION_NAME = getenv('CONSUL_SESSION_NAME', None)
-    SESSION_RENEWAL_SECONDS = int(getenv(
-        'CONSUL_SESSION_RENEWAL_SECONDS', '75'))
+    SESSION_TTL_SECONDS = int(getenv('CONSUL_SESSION_TTL_SECONDS', '75'))
+    SESSION_HEARTBEAT_SECONDS = int(getenv('CONSUL_SESSION_HEARTBEAT_SECONDS', '75'))
+    SESSION_LOCK_DELAY_SECONDS = int(getenv('CONSUL_SESSION_LOCK_DELAY_SECONDS', '15'))
+    SESSION_CREATE_RETRY_DELAY_SECONDS = 5
 
-    def __init__(self, name=None, renewal_interval=None,
-                 host=CONSUL_HOST, port=CONSUL_PORT, token=CONSUL_TOKEN,
-                 scheme=CONSUL_SCHEME, dc=CONSUL_DC, verify=CONSUL_VERIFY,
+    def __init__(self, name, behavior='delete', ttl=None, heartbeat_interval=None, lock_delay=None, host=CONSUL_HOST,
+                 port=CONSUL_PORT, token=CONSUL_TOKEN, scheme=CONSUL_SCHEME, dc=CONSUL_DC, verify=CONSUL_VERIFY,
                  **kwargs):
         """
+        :type behavior: str
+        :param behavior: consul session behavior (release, delete)
+        :type ttl: int
+        :param ttl: time to live for the session before it is invalidated
         :param name: session name to use
         :type name: str
-        :param renewal_interval: interval (in seconds) in which a session
+        :param heartbeat_interval: interval (in seconds) in which a session
             should be renewed, this value is also used as the session ttl.
-        :type renewal_interval: str
+        :type heartbeat_interval: str
+        :type lock_delay: int
+        :param lock_delay: consul lock delay to use for sessions
         """
-        self.name = name if name is not None else self.SESSION_NAME
-        self.ttl = renewal_interval \
-            if renewal_interval is not None else self.SESSION_RENEWAL_SECONDS
-        self.consul = Consul(
-            host=host, port=port, token=token, scheme=scheme, dc=dc,
-            verify=verify, **kwargs)
-        self.consul_sync = ConsulSynchronous(
-            host=host, port=port, token=token, scheme=scheme, dc=dc,
-            verify=verify, **kwargs)
-        self.session_id = None
+        assert behavior in ('release', 'delete')
+        self.name = name
+        self.ttl = ttl or self.SESSION_TTL_SECONDS
+        self.heartbeat_interval = heartbeat_interval or self.SESSION_HEARTBEAT_SECONDS
+        self.lock_delay = lock_delay or self.SESSION_LOCK_DELAY_SECONDS
+        if 0 > self.lock_delay > 60:
+            self.logger.debug('invalid lock-delay=%s specified, using defaults', self.lock_delay)
+            self.lock_delay = 15
+        self.consul = Consul(host=host, port=port, token=token, scheme=scheme, dc=dc, verify=verify, **kwargs)
+        self.session = None
         self.heartbeat = task.LoopingCall(self.session_renew)
+        reactor.callLater(0, self.session_create)
         self.start()
         reactor.addSystemEventTrigger('before', 'shutdown', self.stop)
+        reactor.addSystemEventTrigger('before', 'shutdown', self.session_destroy)
+
+    @property
+    def agent(self):
+        return self.consul
 
     def start(self):
         """
-        Start this instance by creating a new session and starting heartbeat
-        renewals.
+        Start this instance.
         """
-        self.logger.debug('starting consul agent')
-        reactor.callLater(0, self.session_create)
-        reactor.callLater(self.ttl, self.heartbeat.start, interval=self.ttl)
+        self.logger.trace('starting consul agent')
 
     def stop(self):
         """
-        Execute clean-up tasks, including stopping heartbeat (renewal) and
-        session destruction.
+        Execute clean-up tasks.
         """
-        self.logger.debug('stopping consul agent')
-
-        if self.heartbeat.running:
-            self.logger.trace('stopping heartbeat')
-            self.heartbeat.stop()
-
-        if self.session_id is not None:
-            self.logger.trace('session=%s destroying', self.session_id)
-            self.consul_sync.session.destroy(session_id=self.session_id)
+        self.logger.trace('stopping consul agent')
 
     @property
     def ready(self):
         """Check if a session has been established with consul."""
-        return self.session_id is not None
+        return self.session is not None
 
     @defer.inlineCallbacks
-    def wait_for_ready(self, attempts=None, interval=3):
+    def wait_for_ready(self, attempts=None, interval=None):
         """
         :param attempts: number of attempts before giving up, if None there is
             no giving up.
         :type attempts: int or None
-        :param interval: interval (in seconds) between each check, if None,
-            session ttl / 4 is used. (default=3)
+        :param interval: interval (in seconds), by default the create retry interval is used
         :type interval: int or None
         """
-        interval = interval if interval is not None else self.ttl / 4
+        interval = interval if interval is not None else self.SESSION_CREATE_RETRY_DELAY_SECONDS
         attempt = 0
         while not self.ready and (attempts is None or attempt <= attempts):
             attempt += 1
-            self.logger.debug(
-                'attempt=%s interval=%ss waiting for session to established',
-                attempt, interval
-            )
+            self.logger.debug('attempt=%s interval=%ss waiting for session to established', attempt, interval)
             yield async_sleep(interval)
 
     @defer.inlineCallbacks
@@ -107,26 +102,50 @@ class SessionedConsulAgent(LoggedObject, object):
         """
         try:
             self.logger.trace('attempting to create a new session')
-            self.session_id = yield self.consul.session.create(self.name)
-            self.logger.info('session=%s created', self.session_id)
+            self.session = yield self.consul.session.create(
+                self.name, behavior='delete', ttl=self.ttl, lock_delay=self.lock_delay)
+            self.logger.info('name=%s session=%s created', self.name, self.session)
+
+            if not self.heartbeat.running:
+                reactor.callLater(0, self.heartbeat.start, interval=self.heartbeat_interval)
         except ConsulException as e:
             self.logger.warning(
                 'session=%s creation failed, retrying reason=%s',
-                self.session_id, e.message)
+                self.session, e.message)
             if retry:
-                reactor.callLater(self.ttl / 2, self.session_create)
+                # try again in SESSION_CREATE_RETRY_DELAY_SECONDS
+                reactor.callLater(self.SESSION_CREATE_RETRY_DELAY_SECONDS, self.session_create)
 
     @defer.inlineCallbacks
     def session_renew(self):
         """Renew session if one is active, else do nothing."""
         try:
-            if self.session_id is not None:
-                self.logger.trace('session=%s renewing', self.session_id)
-                yield self.consul.session.renew(self.session_id)
+            if self.session is not None:
+                self.logger.trace('name=%s session=%s renewing', self.name, self.session)
+                yield self.consul.session.renew(self.session)
         except ConsulException as e:
             self.logger.warning(
                 'session=%s renewal attempt failed reason=%s',
-                self.session_id, e.message
+                self.session, e.message
+            )
+
+    @defer.inlineCallbacks
+    def session_destroy(self):
+        """Destroy a session if one is active, else do nothing."""
+        try:
+            if self.session is not None:
+                if self.heartbeat.running:
+                    self.logger.trace('name=%s session=%s stopping heartbeat', self.name, self.session)
+                    self.heartbeat.stop()
+
+                self.logger.trace('name=%s session=%s destroying', self.name, self.session)
+                yield self.consul.session.destroy(self.session)
+                self.logger.info('name=%s session=%s destroyed', self.name, self.session)
+                self.session = None
+        except ConsulException as e:
+            self.logger.warning(
+                'session=%s destruction attempt failed reason=%s',
+                self.session, e.message
             )
 
     @classmethod
@@ -145,7 +164,7 @@ class SessionedConsulAgent(LoggedObject, object):
         assert action in ('acquire', 'release')
         self.logger.debug(
             'lock=%s action=%s session=%s value=%s',
-            key, action, self.session_id, value
+            key, action, self.session, value
         )
         if not self.ready:
             self.logger.trace(
@@ -155,7 +174,7 @@ class SessionedConsulAgent(LoggedObject, object):
             result = False
         else:
             result = yield self.consul.kv.put(
-                key=key, value=value, **{action: self.session_id})
+                key=key, value=value, **{action: self.session})
         self.logger.info('lock=%s action=%s result=%s', key, action, result)
         defer.returnValue(result)
 
@@ -187,3 +206,79 @@ class SessionedConsulAgent(LoggedObject, object):
                 self.logger.warning(
                     'key=%s failed to delete reason=%s', key, e.message)
         defer.returnValue(result)
+
+
+class DistributedConsulAgent(SessionedConsulAgent):
+    ELECTION_EXPIRY = int(getenv('CONSUL_ELECTION_EXPIRY', SessionedConsulAgent.SESSION_HEARTBEAT_SECONDS))
+    ELECTION_RETRY = int(getenv('CONSUL_ELECTION_RETRY', SessionedConsulAgent.SESSION_CREATE_RETRY_DELAY_SECONDS))
+
+    def __init__(self, name, behavior='delete', ttl=None, heartbeat_interval=None, lock_delay=None, host=CONSUL_HOST,
+                 port=CONSUL_PORT, token=CONSUL_TOKEN, scheme=CONSUL_SCHEME, dc=CONSUL_DC, verify=CONSUL_VERIFY,
+                 **kwargs):
+        super(DistributedConsulAgent, self).__init__(
+            name, behavior=behavior, ttl=ttl, heartbeat_interval=heartbeat_interval, lock_delay=lock_delay,
+            host=host, port=port, token=token, scheme=scheme, dc=dc, verify=verify, **kwargs
+        )
+        self._leader = None
+        self.leader_key = 'service/{}/leader'.format(name)
+        reactor.callLater(0, self.update_leader)
+
+    @property
+    def leader(self):
+        """Current leader data"""
+        return self._leader
+
+    @leader.setter
+    def leader(self, value):
+        self._leader = value
+        if value is None:
+            # immediate retry if we are the leader
+            reactor.callLater(0, self.acquire_leadership)
+
+    @property
+    def is_leader(self):
+        return self.session is not None and self.session == self.leader
+
+    @defer.inlineCallbacks
+    def update_leader(self, index=None):
+        index, data = yield self.agent.kv.get(key=self.leader_key, index=index)
+        if data is not None and hasattr(data, 'get'):
+            self.leader = data.get('Value', None)
+        else:
+            # the key does not exist, we are using 'delete' behaviour
+            self.leader = None
+        self.logger.trace('name=%s session=%s leader=%s', self.name, self.session, self.leader)
+        reactor.callLater(0, self.update_leader, index=index)
+
+    @property
+    def candidate_data(self):
+        """
+        Data to use when applying for leadership.
+
+        :rtype: str
+        """
+        return self.session
+
+    @defer.inlineCallbacks
+    def acquire_leadership(self):
+        """
+        Try to acquire leadership.
+
+        :rtype: bool
+        """
+        if self.session is None:
+            self.logger.trace('name=%s session not ready, retrying later', self.name)
+            reactor.callLater(self.ELECTION_RETRY, self.acquire_leadership)
+        elif self.leader is not None:
+            self.logger.trace('name=%s leader exists, skipping', self.name)
+            defer.returnValue(self.is_leader)
+        else:
+            value = self.candidate_data
+            self.logger.trace('name=%s session=%s can i haz leadership', self.name, self.session)
+            result = yield self.acquire_lock(key=self.leader_key, value=value)
+            if result:
+                self.logger.info('name=%s session=%s acquired leadership', self.name, self.session)
+            else:
+                # handle consul lock-delay safe guard, retry a bit later
+                reactor.callLater(self.ELECTION_RETRY, self.acquire_leadership)
+            self.logger.trace('name=%s session=%s acquired_leadership=%s', self.name, self.session, result)
