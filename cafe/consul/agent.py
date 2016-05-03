@@ -220,6 +220,7 @@ class DistributedConsulAgent(SessionedConsulAgent):
             host=host, port=port, token=token, scheme=scheme, dc=dc, verify=verify, **kwargs
         )
         self._leader = None
+        self.is_leader = False
         self.leader_key = 'service/{}/leader'.format(name)
         reactor.callLater(0, self.update_leader)
 
@@ -234,10 +235,6 @@ class DistributedConsulAgent(SessionedConsulAgent):
         if value is None:
             # immediate retry if we are the leader
             reactor.callLater(0, self.acquire_leadership)
-
-    @property
-    def is_leader(self):
-        return self.session is not None and self.session == self.leader
 
     @defer.inlineCallbacks
     def update_leader(self, index=None):
@@ -275,10 +272,10 @@ class DistributedConsulAgent(SessionedConsulAgent):
         else:
             value = self.candidate_data
             self.logger.trace('name=%s session=%s can i haz leadership', self.name, self.session)
-            result = yield self.acquire_lock(key=self.leader_key, value=value)
-            if result:
+            self.is_leader = yield self.acquire_lock(key=self.leader_key, value=value)
+            if self.is_leader:
                 self.logger.info('name=%s session=%s acquired leadership', self.name, self.session)
             else:
                 # handle consul lock-delay safe guard, retry a bit later
                 reactor.callLater(self.ELECTION_RETRY, self.acquire_leadership)
-            self.logger.trace('name=%s session=%s acquired_leadership=%s', self.name, self.session, result)
+            self.logger.trace('name=%s session=%s acquired_leadership=%s', self.name, self.session, self.is_leader)
