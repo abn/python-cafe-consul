@@ -221,6 +221,7 @@ class DistributedConsulAgent(SessionedConsulAgent):
         )
         self._leader = None
         self.is_leader = False
+        self._abstain = False
         self.leader_key = 'service/{}/leader'.format(name)
         reactor.callLater(0, self.update_leader)
 
@@ -266,9 +267,10 @@ class DistributedConsulAgent(SessionedConsulAgent):
         if self.session is None:
             self.logger.trace('name=%s session not ready, retrying later', self.name)
             reactor.callLater(self.ELECTION_RETRY, self.acquire_leadership)
+        elif self._abstain:
+            self.logger.trace('name=%s session=%s currently abstaining from elections, skipping', self.name, self.session)
         elif self.leader is not None:
             self.logger.trace('name=%s leader exists, skipping', self.name)
-            defer.returnValue(self.is_leader)
         else:
             value = self.candidate_data
             self.logger.trace('name=%s session=%s can i haz leadership', self.name, self.session)
@@ -279,6 +281,24 @@ class DistributedConsulAgent(SessionedConsulAgent):
                 # handle consul lock-delay safe guard, retry a bit later
                 reactor.callLater(self.ELECTION_RETRY, self.acquire_leadership)
             self.logger.trace('name=%s session=%s acquired_leadership=%s', self.name, self.session, self.is_leader)
+        defer.returnValue(self.is_leader)
+
+    @defer.inlineCallbacks
+    def relinquish_leadership(self, abstain=False):
+        """
+        :param abstain: abstain from next election till a new leader is elected,
+            WARNING: be sure you know what you are doing, this can lead to potential deadlocks.
+        :type abstain: bool
+        """
+        try:
+            self.logger.info('name=%s session=%s relinquishing leadership', self.name, self.session)
+            self._abstain = abstain
+            yield self.release_lock(key=self.leader_key)
+            if abstain:
+                self.logger.debug('name=%s session=%s waiting for next leader', self.name, self.session)
+                yield self.wait_for_leader()
+        finally:
+            self._abstain = False
 
     @defer.inlineCallbacks
     def wait_for_leader(self, attempts=None, interval=None):
