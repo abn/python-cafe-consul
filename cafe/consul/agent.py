@@ -179,7 +179,7 @@ class SessionedConsulAgent(LoggedObject, object):
         defer.returnValue(result)
 
     @defer.inlineCallbacks
-    def acquire_lock(self, key, value=None):
+    def acquire_lock(self, key, value=''):
         """
         Acquire a lock with a provided value.
 
@@ -190,15 +190,16 @@ class SessionedConsulAgent(LoggedObject, object):
         defer.returnValue(result)
 
     @defer.inlineCallbacks
-    def release_lock(self, key, value=None):
+    def release_lock(self, key, value='', delete=False):
         """
         Release a lock with a provided value.
 
         :type key: str
         :type value: str
+        :type delete: bool
         """
         result = yield self._lock(action='release', key=key, value=value)
-        if result:
+        if result and delete:
             try:
                 self.logger.trace('key=%s deleting as lock is released', key)
                 yield self.consul.kv.delete(key=key)
