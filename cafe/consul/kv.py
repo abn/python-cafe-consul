@@ -8,6 +8,7 @@ class KVData(object):
         self.Value = data.get('Value')
         self.Flags = data.get('Flags')
         self.Key = data.get('Key')
+        self.Session = data.get('Session', None)
 
     @property
     def created(self):
@@ -16,3 +17,17 @@ class KVData(object):
     @property
     def modified(self):
         return self.ModifyIndex > self.CreateIndex
+
+    def _compare(self, other):
+        if isinstance(other, int):
+            return self.ModifyIndex - other
+        return self.ModifyIndex - other.ModifyIndex
+
+    def __gt__(self, other):
+        return self._compare(other) < 0
+
+    def __eq__(self, other):
+        return self._compare(other) == 0
+
+    def __lt__(self, other):
+        return self._compare(other) > 0
