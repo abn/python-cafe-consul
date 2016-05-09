@@ -15,10 +15,11 @@ CONSUL_VERIFY = bool(getenv('CONSUL_VERIFY', 'True'))
 
 
 class SessionedConsulAgent(LoggedObject, object):
+    GLOBAL_RETRY_DELAY_SECONDS = int(getenv('CONSUL_GLOBAL_RETRY_DELAY_SECONDS', 10))
     SESSION_TTL_SECONDS = int(getenv('CONSUL_SESSION_TTL_SECONDS', '75'))
     SESSION_HEARTBEAT_SECONDS = int(getenv('CONSUL_SESSION_HEARTBEAT_SECONDS', '75'))
     SESSION_LOCK_DELAY_SECONDS = int(getenv('CONSUL_SESSION_LOCK_DELAY_SECONDS', '15'))
-    SESSION_CREATE_RETRY_DELAY_SECONDS = 5
+    SESSION_CREATE_RETRY_DELAY_SECONDS = GLOBAL_RETRY_DELAY_SECONDS
 
     def __init__(self, name, behavior='delete', ttl=None, heartbeat_interval=None, lock_delay=None, host=CONSUL_HOST,
                  port=CONSUL_PORT, token=CONSUL_TOKEN, scheme=CONSUL_SCHEME, dc=CONSUL_DC, verify=CONSUL_VERIFY,
@@ -240,13 +241,18 @@ class DistributedConsulAgent(SessionedConsulAgent):
 
     @defer.inlineCallbacks
     def update_leader(self, index=None):
-        index, data = yield self.agent.kv.get(key=self.leader_key, index=index)
-        if data is not None and hasattr(data, 'get'):
-            self.leader = data.get('Value', None)
-        else:
-            # the key does not exist, we are using 'delete' behaviour
-            self.leader = None
-        self.logger.trace('name=%s session=%s leader=%s', self.name, self.session, self.leader)
+        try:
+            index, data = yield self.agent.kv.get(key=self.leader_key, index=index)
+            if data is not None and hasattr(data, 'get'):
+                self.leader = data.get('Value', None)
+            else:
+                # the key does not exist, we are using 'delete' behaviour
+                self.leader = None
+            self.logger.trace('name=%s session=%s leader=%s', self.name, self.session, self.leader)
+        except ConsulException as e:
+            self.logger.error(
+                'leader update failed, retrying later exception=%s message=%s', e.__class__.__name__, e.message)
+            yield async_sleep(self.SESSION_CREATE_RETRY_DELAY_SECONDS)
         reactor.callLater(0, self.update_leader, index=index)
 
     @property
@@ -269,19 +275,24 @@ class DistributedConsulAgent(SessionedConsulAgent):
             self.logger.trace('name=%s session not ready, retrying later', self.name)
             reactor.callLater(self.ELECTION_RETRY, self.acquire_leadership)
         elif self._abstain:
-            self.logger.trace('name=%s session=%s currently abstaining from elections, skipping', self.name, self.session)
+            self.logger.trace('name=%s session=%s currently abstaining from elections, skipping', self.name,
+                              self.session)
         elif self.leader is not None:
             self.logger.trace('name=%s leader exists, skipping', self.name)
         else:
             value = self.candidate_data
             self.logger.trace('name=%s session=%s can i haz leadership', self.name, self.session)
-            self.is_leader = yield self.acquire_lock(key=self.leader_key, value=value)
-            if self.is_leader:
-                self.logger.info('name=%s session=%s acquired leadership', self.name, self.session)
-            else:
-                # handle consul lock-delay safe guard, retry a bit later
-                reactor.callLater(self.ELECTION_RETRY, self.acquire_leadership)
-            self.logger.trace('name=%s session=%s acquired_leadership=%s', self.name, self.session, self.is_leader)
+            try:
+                self.is_leader = yield self.acquire_lock(key=self.leader_key, value=value)
+                if self.is_leader:
+                    self.logger.info('name=%s session=%s acquired leadership', self.name, self.session)
+                else:
+                    # handle consul lock-delay safe guard, retry a bit later
+                    reactor.callLater(self.ELECTION_RETRY, self.acquire_leadership)
+                self.logger.trace('name=%s session=%s acquired_leadership=%s', self.name, self.session, self.is_leader)
+            except ConsulException as e:
+                self.logger.trace('name=%s session=%s acquiring leadership attempt failed reason=%s', self.name,
+                                  self.session, self.is_leader, e.message)
         defer.returnValue(self.is_leader)
 
     @defer.inlineCallbacks
@@ -317,3 +328,9 @@ class DistributedConsulAgent(SessionedConsulAgent):
             attempt += 1
             self.logger.debug('attempt=%s interval=%ss waiting for leader to be elected', attempt, interval)
             yield async_sleep(interval)
+
+    @defer.inlineCallbacks
+    def wait_for_leadership(self):
+        yield self.wait_for_leader()
+        while not self.is_leader:
+            yield async_sleep(self.ELECTION_EXPIRY)
