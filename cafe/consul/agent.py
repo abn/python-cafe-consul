@@ -122,7 +122,7 @@ class SessionedConsulAgent(LoggedObject, object):
         """Renew session if one is active, else do nothing."""
         try:
             if self.session is not None:
-                self.logger.trace('name=%s session=%s renewing', self.name, self.session)
+                self.logger.trace('name=%s session=%s renewing session', self.name, self.session)
                 yield self.consul.session.renew(self.session)
         except ConsulException as e:
             self.logger.warning(
@@ -139,9 +139,9 @@ class SessionedConsulAgent(LoggedObject, object):
                     self.logger.trace('name=%s session=%s stopping heartbeat', self.name, self.session)
                     self.heartbeat.stop()
 
-                self.logger.trace('name=%s session=%s destroying', self.name, self.session)
+                self.logger.trace('name=%s session=%s destroying session', self.name, self.session)
                 yield self.consul.session.destroy(self.session)
-                self.logger.info('name=%s session=%s destroyed', self.name, self.session)
+                self.logger.info('name=%s session=%s destroyed session', self.name, self.session)
                 self.session = None
         except ConsulException as e:
             self.logger.warning(
@@ -207,6 +207,29 @@ class SessionedConsulAgent(LoggedObject, object):
             except ConsulException as e:
                 self.logger.warning(
                     'key=%s failed to delete reason=%s', key, e.message)
+        defer.returnValue(result)
+
+    @defer.inlineCallbacks
+    def wait_for_lock(self, key, attempts=None):
+        """
+        Wait till a lock is acquired. If attempts is None, wait for ever.
+
+        :type key: str
+        :type attempts: None or int
+        :rtype: bool
+        """
+        index = None
+        result = False
+        yield self.wait_for_ready()
+        while not result and (attempts is None or attempts >= 0):
+            self.logger.debug(
+                'lock=%s waiting for lock; %s attempts left',
+                key, attempts if attempts is not None else 'infinite')
+            result = yield self.acquire_lock(key=key)
+            if not result:
+                index, _ = yield self.agent.kv.get(key=key, index=index)
+                if attempts is not None:
+                    attempts -= 1
         defer.returnValue(result)
 
 
@@ -292,7 +315,7 @@ class DistributedConsulAgent(SessionedConsulAgent):
                 self.logger.trace('name=%s session=%s acquired_leadership=%s', self.name, self.session, self.is_leader)
             except ConsulException as e:
                 self.logger.trace('name=%s session=%s acquiring leadership attempt failed reason=%s', self.name,
-                                  self.session, self.is_leader, e.message)
+                                  self.session, e.message)
         defer.returnValue(self.is_leader)
 
     @defer.inlineCallbacks
