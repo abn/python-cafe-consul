@@ -210,11 +210,12 @@ class SessionedConsulAgent(LoggedObject, object):
         defer.returnValue(result)
 
     @defer.inlineCallbacks
-    def wait_for_lock(self, key, attempts=None):
+    def wait_for_lock(self, key, value='', attempts=None):
         """
         Wait till a lock is acquired. If attempts is None, wait for ever.
 
         :type key: str
+        :type value: str
         :type attempts: None or int
         :rtype: bool
         """
@@ -225,7 +226,7 @@ class SessionedConsulAgent(LoggedObject, object):
             self.logger.debug(
                 'lock=%s waiting for lock; %s attempts left',
                 key, attempts if attempts is not None else 'infinite')
-            result = yield self.acquire_lock(key=key)
+            result = yield self.acquire_lock(key=key, value=value)
             if not result:
                 index, _ = yield self.agent.kv.get(key=key, index=index)
                 if attempts is not None:
