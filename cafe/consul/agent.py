@@ -155,7 +155,7 @@ class SessionedConsulAgent(LoggedObject, object):
         return '/'.join(args)
 
     @defer.inlineCallbacks
-    def _lock(self, action, key, value=None):
+    def _lock(self, action, key, value=''):
         """
         Internal method to acquire/release a lock
 
