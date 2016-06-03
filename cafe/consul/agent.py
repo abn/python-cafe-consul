@@ -5,6 +5,8 @@ from cafe.logging import LoggedObject
 from cafe.twisted import async_sleep
 from consul.base import ConsulException
 from consul.twisted import Consul
+from consul.std import Consul as ConsulStandardAgent
+
 
 CONSUL_HOST = getenv('CONSUL_HOST', '127.0.0.1')
 CONSUL_PORT = int(getenv('CONSUL_PORT', '8500'))
@@ -12,6 +14,13 @@ CONSUL_TOKEN = getenv('CONSUL_TOKEN', None)
 CONSUL_SCHEME = getenv('CONSUL_SCHEME', 'http')
 CONSUL_DC = getenv('CONSUL_DC', None)
 CONSUL_VERIFY = bool(getenv('CONSUL_VERIFY', 'True'))
+
+
+class SimpleConsulClient(ConsulStandardAgent, object):
+    def __init__(self, host=CONSUL_HOST, port=CONSUL_PORT, token=CONSUL_TOKEN, scheme=CONSUL_SCHEME, dc=CONSUL_DC,
+                 verify=CONSUL_VERIFY, **kwargs):
+        super(SimpleConsulClient, self).__init__(
+            host=host, port=port, token=token, scheme=scheme, dc=dc, verify=verify, **kwargs)
 
 
 class SessionedConsulAgent(LoggedObject, object):
