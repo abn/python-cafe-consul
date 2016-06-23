@@ -3,10 +3,9 @@ from twisted.internet import defer, reactor, task
 
 from cafe.logging import LoggedObject
 from cafe.twisted import async_sleep
-from consul.base import ConsulException
-from consul.twisted import Consul
+from consul.base import Consul as ConsulBase, ConsulException
 from consul.std import Consul as ConsulStandardAgent
-
+from consul.twisted import Consul
 
 CONSUL_HOST = getenv('CONSUL_HOST', '127.0.0.1')
 CONSUL_PORT = int(getenv('CONSUL_PORT', '8500'))
@@ -23,7 +22,7 @@ class SimpleConsulClient(ConsulStandardAgent, object):
             host=host, port=port, token=token, scheme=scheme, dc=dc, verify=verify, **kwargs)
 
 
-class SessionedConsulAgent(LoggedObject, object):
+class SessionedConsulAgent(LoggedObject, ConsulBase):
     GLOBAL_RETRY_DELAY_SECONDS = int(getenv('CONSUL_GLOBAL_RETRY_DELAY_SECONDS', 10))
     SESSION_TTL_SECONDS = int(getenv('CONSUL_SESSION_TTL_SECONDS', '75'))
     SESSION_HEARTBEAT_SECONDS = int(getenv('CONSUL_SESSION_HEARTBEAT_SECONDS', '75'))
@@ -55,7 +54,7 @@ class SessionedConsulAgent(LoggedObject, object):
             self.logger.debug('invalid lock-delay=%s specified, using defaults', self.lock_delay)
             self.lock_delay = 15
         self.consul = Consul(host=host, port=port, token=token, scheme=scheme, dc=dc, verify=verify, **kwargs)
-        self.session = None
+        self.session_id = None
         self.heartbeat = task.LoopingCall(self.session_renew)
         reactor.callLater(0, self.session_create)
         self.start()
@@ -65,6 +64,13 @@ class SessionedConsulAgent(LoggedObject, object):
     @property
     def agent(self):
         return self.consul
+
+    def __getattr__(self, item):
+        """
+        :type item: str
+        :rtype: consul.base.Consul
+        """
+        return getattr(self.agent, item)
 
     def start(self):
         """
@@ -81,7 +87,7 @@ class SessionedConsulAgent(LoggedObject, object):
     @property
     def ready(self):
         """Check if a session has been established with consul."""
-        return self.session is not None
+        return self.session_id is not None
 
     @defer.inlineCallbacks
     def wait_for_ready(self, attempts=None, interval=None):
@@ -112,16 +118,16 @@ class SessionedConsulAgent(LoggedObject, object):
         """
         try:
             self.logger.trace('attempting to create a new session')
-            self.session = yield self.consul.session.create(
+            self.session_id = yield self.consul.session.create(
                 self.name, behavior='delete', ttl=self.ttl, lock_delay=self.lock_delay)
-            self.logger.info('name=%s session=%s created', self.name, self.session)
+            self.logger.info('name=%s session=%s created', self.name, self.session_id)
 
             if not self.heartbeat.running:
                 reactor.callLater(0, self.heartbeat.start, interval=self.heartbeat_interval)
         except ConsulException as e:
             self.logger.warning(
                 'session=%s creation failed, retrying reason=%s',
-                self.session, e.message)
+                self.session_id, e.message)
             if retry:
                 # try again in SESSION_CREATE_RETRY_DELAY_SECONDS
                 reactor.callLater(self.SESSION_CREATE_RETRY_DELAY_SECONDS, self.session_create)
@@ -130,32 +136,32 @@ class SessionedConsulAgent(LoggedObject, object):
     def session_renew(self):
         """Renew session if one is active, else do nothing."""
         try:
-            if self.session is not None:
-                self.logger.trace('name=%s session=%s renewing session', self.name, self.session)
-                yield self.consul.session.renew(self.session)
+            if self.session_id is not None:
+                self.logger.trace('name=%s session=%s renewing session', self.name, self.session_id)
+                yield self.consul.session.renew(self.session_id)
         except ConsulException as e:
             self.logger.warning(
                 'session=%s renewal attempt failed reason=%s',
-                self.session, e.message
+                self.session_id, e.message
             )
 
     @defer.inlineCallbacks
     def session_destroy(self):
         """Destroy a session if one is active, else do nothing."""
         try:
-            if self.session is not None:
+            if self.session_id is not None:
                 if self.heartbeat.running:
-                    self.logger.trace('name=%s session=%s stopping heartbeat', self.name, self.session)
+                    self.logger.trace('name=%s session=%s stopping heartbeat', self.name, self.session_id)
                     self.heartbeat.stop()
 
-                self.logger.trace('name=%s session=%s destroying session', self.name, self.session)
-                yield self.consul.session.destroy(self.session)
-                self.logger.info('name=%s session=%s destroyed session', self.name, self.session)
-                self.session = None
+                self.logger.trace('name=%s session=%s destroying session', self.name, self.session_id)
+                yield self.consul.session.destroy(self.session_id)
+                self.logger.info('name=%s session=%s destroyed session', self.name, self.session_id)
+                self.session_id = None
         except ConsulException as e:
             self.logger.warning(
                 'session=%s destruction attempt failed reason=%s',
-                self.session, e.message
+                self.session_id, e.message
             )
 
     @classmethod
@@ -164,7 +170,7 @@ class SessionedConsulAgent(LoggedObject, object):
         return '/'.join(args)
 
     @defer.inlineCallbacks
-    def _lock(self, action, key, value=''):
+    def _lock(self, action, key, value='', **kwargs):
         """
         Internal method to acquire/release a lock
 
@@ -174,7 +180,7 @@ class SessionedConsulAgent(LoggedObject, object):
         assert action in ('acquire', 'release')
         self.logger.debug(
             'lock=%s action=%s session=%s value=%s',
-            key, action, self.session, value
+            key, action, self.session_id, value
         )
         if not self.ready:
             self.logger.trace(
@@ -183,24 +189,24 @@ class SessionedConsulAgent(LoggedObject, object):
             )
             result = False
         else:
-            result = yield self.consul.kv.put(
-                key=key, value=value, **{action: self.session})
+            kwargs[action] = self.session_id
+            result = yield self.consul.kv.put(key=key, value=value, **kwargs)
         self.logger.info('lock=%s action=%s result=%s', key, action, result)
         defer.returnValue(result)
 
     @defer.inlineCallbacks
-    def acquire_lock(self, key, value=''):
+    def acquire_lock(self, key, value='', **kwargs):
         """
         Acquire a lock with a provided value.
 
         :type key: str
         :type value: str
         """
-        result = yield self._lock(action='acquire', key=key, value=value)
+        result = yield self._lock(action='acquire', key=key, value=value, **kwargs)
         defer.returnValue(result)
 
     @defer.inlineCallbacks
-    def release_lock(self, key, value='', delete=False):
+    def release_lock(self, key, value='', delete=False, **kwargs):
         """
         Release a lock with a provided value.
 
@@ -208,7 +214,7 @@ class SessionedConsulAgent(LoggedObject, object):
         :type value: str
         :type delete: bool
         """
-        result = yield self._lock(action='release', key=key, value=value)
+        result = yield self._lock(action='release', key=key, value=value, **kwargs)
         if result and delete:
             try:
                 self.logger.trace('key=%s deleting as lock is released', key)
@@ -219,7 +225,7 @@ class SessionedConsulAgent(LoggedObject, object):
         defer.returnValue(result)
 
     @defer.inlineCallbacks
-    def wait_for_lock(self, key, value='', attempts=None):
+    def wait_for_lock(self, key, value='', attempts=None, **kwargs):
         """
         Wait till a lock is acquired. If attempts is None, wait for ever.
 
@@ -235,7 +241,7 @@ class SessionedConsulAgent(LoggedObject, object):
             self.logger.debug(
                 'lock=%s waiting for lock; %s attempts left',
                 key, attempts if attempts is not None else 'infinite')
-            result = yield self.acquire_lock(key=key, value=value)
+            result = yield self.acquire_lock(key=key, value=value, **kwargs)
             if not result:
                 index, _ = yield self.agent.kv.get(key=key, index=index)
                 if attempts is not None:
@@ -281,7 +287,7 @@ class DistributedConsulAgent(SessionedConsulAgent):
             else:
                 # the key does not exist, we are using 'delete' behaviour
                 self.leader = None
-            self.logger.trace('name=%s session=%s leader=%s', self.name, self.session, self.leader)
+            self.logger.trace('name=%s session=%s leader=%s', self.name, self.session_id, self.leader)
         except ConsulException as e:
             self.logger.error(
                 'leader update failed, retrying later exception=%s message=%s', e.__class__.__name__, e.message)
@@ -295,7 +301,7 @@ class DistributedConsulAgent(SessionedConsulAgent):
 
         :rtype: str
         """
-        return self.session
+        return self.session_id
 
     @defer.inlineCallbacks
     def acquire_leadership(self):
@@ -304,28 +310,29 @@ class DistributedConsulAgent(SessionedConsulAgent):
 
         :rtype: bool
         """
-        if self.session is None:
+        if self.session_id is None:
             self.logger.trace('name=%s session not ready, retrying later', self.name)
             reactor.callLater(self.ELECTION_RETRY, self.acquire_leadership)
         elif self._abstain:
             self.logger.trace('name=%s session=%s currently abstaining from elections, skipping', self.name,
-                              self.session)
+                              self.session_id)
         elif self.leader is not None:
             self.logger.trace('name=%s leader exists, skipping', self.name)
         else:
             value = self.candidate_data
-            self.logger.trace('name=%s session=%s can i haz leadership', self.name, self.session)
+            self.logger.trace('name=%s session=%s can i haz leadership', self.name, self.session_id)
             try:
                 self.is_leader = yield self.acquire_lock(key=self.leader_key, value=value)
                 if self.is_leader:
-                    self.logger.info('name=%s session=%s acquired leadership', self.name, self.session)
+                    self.logger.info('name=%s session=%s acquired leadership', self.name, self.session_id)
                 else:
                     # handle consul lock-delay safe guard, retry a bit later
                     reactor.callLater(self.ELECTION_RETRY, self.acquire_leadership)
-                self.logger.trace('name=%s session=%s acquired_leadership=%s', self.name, self.session, self.is_leader)
+                self.logger.trace('name=%s session=%s acquired_leadership=%s', self.name, self.session_id,
+                                  self.is_leader)
             except ConsulException as e:
                 self.logger.trace('name=%s session=%s acquiring leadership attempt failed reason=%s', self.name,
-                                  self.session, e.message)
+                                  self.session_id, e.message)
         defer.returnValue(self.is_leader)
 
     @defer.inlineCallbacks
@@ -336,11 +343,11 @@ class DistributedConsulAgent(SessionedConsulAgent):
         :type abstain: bool
         """
         try:
-            self.logger.info('name=%s session=%s relinquishing leadership', self.name, self.session)
+            self.logger.info('name=%s session=%s relinquishing leadership', self.name, self.session_id)
             self._abstain = abstain
             yield self.release_lock(key=self.leader_key)
             if abstain:
-                self.logger.debug('name=%s session=%s waiting for next leader', self.name, self.session)
+                self.logger.debug('name=%s session=%s waiting for next leader', self.name, self.session_id)
                 yield self.wait_for_leader()
         finally:
             self._abstain = False
