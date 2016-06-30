@@ -1,28 +1,27 @@
 from twisted.internet import defer
 
 from cafe.consul.kv import KVData
-from cafe.logging import LoggedObject
+from cafe.consul.lock import AbstractConsulLock
 
 
-class Semaphore(LoggedObject):
+class ConsulSemaphore(AbstractConsulLock):
     """
     A simplified semaphore implementation.
     """
 
-    def __init__(self, agent, prefix=None, limit=3, cardinality=None):
-        self.agent = agent
-        """:type: cafe.consul.agent.SessionedConsulAgent"""
-        self.prefix = prefix \
-            if prefix is not None \
+    def __init__(self, agent, key=None, value='', delete=False, limit=3, cardinality=None, **kwargs):
+        key = key \
+            if key is not None \
             else 'service/{}/semaphore'.format(agent.name)
+        super(ConsulSemaphore, self).__init__(agent, key=key, value=value, delete=delete, **kwargs)
         self.limit = limit
         self.cardinality = cardinality
-        self.slots = set(['{}/{}'.format(self.prefix, i) for i in range(limit)])
+        self.slots = set(['{}/{}'.format(self.key, i) for i in range(limit)])
         self.slots_held = set()
 
     @defer.inlineCallbacks
     def _acquire(self, data, value, **kwargs):
-        self.logger.trace('prefix=%s data=%s', self.prefix, data)
+        self.logger.trace('prefix=%s data=%s', self.key, data)
         result = False
         available = set()
 
@@ -32,15 +31,15 @@ class Semaphore(LoggedObject):
             used_slots = [
                 d.Key for d in [KVData(kv) for kv in data] if d.Session is not None
             ]
-            self.logger.trace('prefix=%s used slots=%s', self.prefix, len(used_slots))
+            self.logger.trace('prefix=%s used slots=%s', self.key, len(used_slots))
             if len(used_slots) < self.limit:
                 available = set(self.slots) - set(used_slots)
 
-        self.logger.debug('prefix=%s available slots=%s', self.prefix, len(available))
+        self.logger.debug('prefix=%s available slots=%s', self.key, len(available))
         for slot in available:
             # try to acquire lock on each
-            self.logger.trace('prefix=%s trying slot=%s', self.prefix, slot)
-            result = yield self.agent.acquire_lock(slot, value=value, **kwargs)
+            self.logger.trace('prefix=%s trying slot=%s', self.key, slot)
+            result = yield self.agent.lock(key=slot, value=value, **kwargs).acquire()
             if result:
                 self.slots_held.add(slot)
                 break
@@ -72,10 +71,15 @@ class Semaphore(LoggedObject):
             if block and retries is not None:
                 retries -= 1
                 block = retries > 0
-                self.logger.debug('prefix=%s %s retries left', self.prefix, retries)
-            index, data = yield self.agent.agent.kv.get(self.prefix, index=index, recurse=True)
+                self.logger.debug('prefix=%s %s retries left', self.key, retries)
+            index, data = yield self.agent.agent.kv.get(self.key, index=index, recurse=True)
             result = yield self._acquire(data, value, **kwargs)
 
+        defer.returnValue(result)
+
+    @defer.inlineCallbacks
+    def wait(self, value=None, attempts=None, **kwargs):
+        result = yield self.acquire(value=value, block=True, retries=attempts, **kwargs)
         defer.returnValue(result)
 
     @property
@@ -84,9 +88,9 @@ class Semaphore(LoggedObject):
         return len(self.slots_held) > 0
 
     @defer.inlineCallbacks
-    def release(self, slots=None, value='', delete=False, **kwargs):
+    def release(self, slots=None, value=None, delete=None, **kwargs):
         """
-        Release all or specified slots. If `slots` is `None`, all slots are released.
+        Release one slot or specified slots. If `slots` is `None`, first slot is released.
 
         :type slots: None or list[str]
         :type value: str
@@ -95,31 +99,34 @@ class Semaphore(LoggedObject):
         :rtype: dict[str, bool]
         """
         if slots is None:
-            slots = self.slots_held.copy()
+            slots = [next(iter(self.slots_held))]
         elif not isinstance(slots, list):
             slots = [slots]
 
-        self.logger.debug('prefix=%s releasing %s slots', self.prefix, len(slots))
+        self.logger.debug('prefix=%s releasing %s slots', self.key, len(slots))
+
+        value = value if value is not None else self.value
+        delete = delete if delete is not None else delete
 
         results = {}
+        # noinspection PyTypeChecker
         for slot in slots:
             if slot not in self.slots_held:
-                self.logger.debug('prefix=%s skipping release of unheld slot=%s', self.prefix, slot)
+                self.logger.debug('prefix=%s skipping release of unheld slot=%s', self.key, slot)
                 continue
-            results[slot] = yield self.agent.release_lock(slot, value=value, delete=delete, **kwargs)
+            self.agent.lock(key=slot, value=value)
+            results[slot] = yield self.agent.lock(key=slot, value=value, delete=delete, **kwargs).release()
             if results[slot]:
                 self.slots_held.remove(slot)
 
         defer.returnValue(results)
 
     @defer.inlineCallbacks
-    def release_one(self):
+    def release_all(self, value=None, delete=None, **kwargs):
         """
-        Release any one slot, if at least one slot is held. Returns `False` if no slots are held.
+        Release all slots.
 
         :rtype: bool
         """
-        result = False
-        if len(self.slots_held) > 0:
-            result = yield self.release(next(iter(self.slots_held)))
+        result = yield self.release(slots=self.slots_held.copy(), value=value, delete=delete, **kwargs)
         defer.returnValue(result)
