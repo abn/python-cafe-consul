@@ -17,7 +17,15 @@ class ConsulLockContext(LoggedObject, object):
         self.attempts = attempts
         self.delete = delete
         self.kwargs = kwargs
+        self.release_kwargs = {}
         self.locked = False
+
+    @property
+    def key(self):
+        return self.lock.key
+
+    def set_release_kwarg(self, **kwargs):
+        self.release_kwargs.update(other=kwargs)
 
     @defer.inlineCallbacks
     def __enter__(self):
@@ -26,12 +34,10 @@ class ConsulLockContext(LoggedObject, object):
             raise ConsulLockFailed(self.lock.key)
         defer.returnValue(super(ConsulLockContext, self).__enter__())
 
-    @defer.inlineCallbacks
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.locked:
-            yield self.lock.release()
-            # reactor.callLater(0, self.lock.release)
-        defer.returnValue(super(ConsulLockContext, self).__exit__(exc_type, exc_val, exc_tb))
+            self.lock.release(delete=self.delete, **self.release_kwargs)
+        super(ConsulLockContext, self).__exit__(exc_type, exc_val, exc_tb)
 
 
 class ConsulMultiLockContext(LoggedObject, object):
@@ -50,11 +56,14 @@ class ConsulMultiLockContext(LoggedObject, object):
         defer.returnValue(super(ConsulMultiLockContext, self).__enter__())
 
     @defer.inlineCallbacks
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def _exit(self):
         while self._context_stack:
             context = self._context_stack.pop()
-            yield context.__exit__(exc_type, exc_val, exc_tb)
-        defer.returnValue(super(ConsulMultiLockContext, self).__exit__(exc_type, exc_val, exc_tb))
+            yield context.__exit__(None, None, None)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._exit()
+        super(ConsulMultiLockContext, self).__exit__(exc_type, exc_val, exc_tb)
 
 
 class AbstractConsulLock(LoggedObject, AbstractClass):
@@ -132,6 +141,7 @@ class AbstractConsulLock(LoggedObject, AbstractClass):
             self.release()
 
     def context(self, attempts=None, delete=None, **kwargs):
+        """:rtype: cafe.consul.lock.ConsulLockContext"""
         return ConsulLockContext(self, attempts=attempts, delete=delete, **kwargs)
 
 
