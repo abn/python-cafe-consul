@@ -28,8 +28,10 @@ class ConsulSemaphore(AbstractConsulLock):
         if data is None and self.limit > 0:
             available = self.slots
         elif data is not None and isinstance(data, list):
+            # filter known slots that are locked
             used_slots = [
-                d.Key for d in [KVData(kv) for kv in data] if d.Session is not None
+                d.Key for d in [KVData(kv) for kv in data]
+                if d.Key in self.slots and d.Session is not None
             ]
             self.logger.trace('prefix=%s used slots=%s', self.key, len(used_slots))
             if len(used_slots) < self.limit:
