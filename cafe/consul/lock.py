@@ -29,10 +29,13 @@ class ConsulLockContext(LoggedObject, object):
 
     @defer.inlineCallbacks
     def __enter__(self):
-        self.locked = yield self.lock.wait(value=self.lock.value, attempts=self.attempts, **self.kwargs)
+        super(ConsulLockContext, self).__enter__()
+        self.logger.trace('lock=%s entering context', self.lock.key)
+        self.locked = yield self.lock.wait(
+            value=self.lock.value, attempts=self.attempts, **self.kwargs)
         if not self.locked:
             raise ConsulLockFailed(self.lock.key)
-        defer.returnValue(super(ConsulLockContext, self).__enter__())
+        defer.returnValue(self)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.locked:
@@ -143,6 +146,10 @@ class AbstractConsulLock(LoggedObject, AbstractClass):
     def context(self, attempts=None, delete=None, **kwargs):
         """:rtype: cafe.consul.lock.ConsulLockContext"""
         return ConsulLockContext(self, attempts=attempts, delete=delete, **kwargs)
+
+    def __enter__(self):
+        # return a default context
+        return self.context().__enter__()
 
 
 class ConsulLock(AbstractConsulLock):
