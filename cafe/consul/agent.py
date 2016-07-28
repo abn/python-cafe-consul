@@ -1,5 +1,6 @@
 from os import getenv
 from twisted.internet import defer, reactor
+from twisted.internet import task
 
 from cafe.consul.lock import ConsulLock
 from cafe.consul.semaphore import ConsulSemaphore
@@ -88,7 +89,13 @@ class DistributedConsulAgent(SessionedConsulAgent):
         self.is_leader = False
         self._abstain = False
         self.leader_key = 'service/{}/leader'.format(name)
-        reactor.callLater(0, self.update_leader)
+        self._refresh_index = None
+        self.refresh_leader_task = task.LoopingCall(self.refresh_leader)
+        self.refresh_leader_task.start(interval=0, now=True)
+        reactor.addSystemEventTrigger(
+            'before', 'shutdown',
+            lambda: self.refresh_leader_task.stop if self.refresh_leader_task.running else None
+        )
 
     @property
     def leader(self):
@@ -103,7 +110,12 @@ class DistributedConsulAgent(SessionedConsulAgent):
             reactor.callLater(0, self.acquire_leadership)
 
     @defer.inlineCallbacks
-    def update_leader(self, index=None):
+    def refresh_leader(self):
+        self._refresh_index = yield self.update_leader(
+            index=self._refresh_index, sleep_on_error=True)
+
+    @defer.inlineCallbacks
+    def update_leader(self, index=None, sleep_on_error=True):
         try:
             index, data = yield self.agent.kv.get(key=self.leader_key, index=index)
             if data is not None and hasattr(data, 'get'):
@@ -112,11 +124,12 @@ class DistributedConsulAgent(SessionedConsulAgent):
                 # the key does not exist, we are using 'delete' behaviour
                 self.leader = None
             self.logger.trace('name=%s session=%s leader=%s', self.name, self.session.uuid, self.leader)
+            defer.returnValue(index)
         except ConsulException as e:
             self.logger.error(
                 'leader update failed, retrying later exception=%s message=%s', e.__class__.__name__, e.message)
-            yield async_sleep(self.session.SESSION_CREATE_RETRY_DELAY_SECONDS)
-        reactor.callLater(0, self.update_leader, index=index)
+            if sleep_on_error:
+                yield async_sleep(self.session.SESSION_CREATE_RETRY_DELAY_SECONDS)
 
     @property
     def candidate_data(self):
@@ -194,7 +207,7 @@ class DistributedConsulAgent(SessionedConsulAgent):
             yield async_sleep(interval)
 
     @defer.inlineCallbacks
-    def wait_for_leadership(self):
+    def wait_for_leadership(self, index=None):
         yield self.wait_for_leader()
         while not self.is_leader:
-            yield async_sleep(self.ELECTION_EXPIRY)
+            index = yield self.update_leader(index=index, sleep_on_error=True)
