@@ -116,6 +116,10 @@ class DistributedConsulAgent(SessionedConsulAgent):
 
     @defer.inlineCallbacks
     def update_leader(self, index=None, sleep_on_error=True):
+        if self.is_leader and (self.session.uuid is None or self.session.uud != self.leader):
+            # reset leader flag if the session uuid has changed
+            self.is_leader = False
+
         try:
             index, data = yield self.agent.kv.get(key=self.leader_key, index=index)
             if data is not None and hasattr(data, 'get'):
@@ -160,16 +164,18 @@ class DistributedConsulAgent(SessionedConsulAgent):
             self.logger.trace('name=%s session=%s can i haz leadership', self.name, self.session.uuid)
             try:
                 self.is_leader = yield self.lock(key=self.leader_key, value=value).acquire()
-                if self.is_leader:
-                    self.logger.info('name=%s session=%s acquired leadership', self.name, self.session.uuid)
-                else:
-                    # handle consul lock-delay safe guard, retry a bit later
-                    reactor.callLater(self.ELECTION_RETRY, self.acquire_leadership)
-                self.logger.trace('name=%s session=%s acquired_leadership=%s', self.name, self.session.uuid,
-                                  self.is_leader)
             except ConsulException as e:
                 self.logger.trace('name=%s session=%s acquiring leadership attempt failed reason=%s', self.name,
                                   self.session.uuid, e.message)
+                self.is_leader = False
+            if self.is_leader:
+                self.logger.info('name=%s session=%s acquired leadership', self.name, self.session.uuid)
+            else:
+                # handle consul lock-delay safe guard, retry a bit later
+                reactor.callLater(self.ELECTION_RETRY, self.acquire_leadership)
+            self.logger.trace('name=%s session=%s acquired_leadership=%s', self.name, self.session.uuid,
+                              self.is_leader)
+
         defer.returnValue(self.is_leader)
 
     @defer.inlineCallbacks

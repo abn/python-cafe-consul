@@ -4,7 +4,7 @@ from twisted.internet import task, reactor, defer
 from cafe.logging import LoggedObject
 from cafe.twisted import async_sleep
 from consul import ConsulException
-from consul.base import Consul as ConsulBase
+from consul.base import Consul as ConsulBase, NotFound
 
 
 # noinspection PyMethodOverriding
@@ -60,6 +60,7 @@ class ConsulSessionWrapper(LoggedObject, ConsulBase.Session):
             self._uuid = yield self.base.create(
                 self.name, behavior='delete', ttl=self.ttl, lock_delay=self.lock_delay)
             self.logger.info('name=%s session=%s created', self.name, self.uuid)
+            reactor.callLater(0, self.watch_for_session_change)
 
             if not self.heartbeat.running:
                 reactor.callLater(0, self.heartbeat.start, interval=self.heartbeat_interval)
@@ -72,12 +73,43 @@ class ConsulSessionWrapper(LoggedObject, ConsulBase.Session):
                 reactor.callLater(self.SESSION_CREATE_RETRY_DELAY_SECONDS, self.create)
 
     @defer.inlineCallbacks
+    def watch_for_session_change(self, index=None):
+        """If the session is changed or removed on the Consul server/cluster,
+        we need to know about it. Here we call the /v1/session/info endpoint
+        to get the session details.
+
+        When `index` is provided, the call to `info` will block, until either
+        the wait time is reached, or something happens to the session that
+        makes the GET invalid. If the wait time is reached, we simply
+        reschedule `watch_for_session_change`.  If the session is no longer
+        valid, we schedule a new session creation.
+
+        :param index: The current Consul index. If provided, the `info` get
+                      will block.
+        :type index: int
+        :rtype: None
+        """
+        index, session = yield self.base.info(self._uuid, index=index)
+        if not session:
+            self.logger.warning(
+                'The Consul session is missing. This should almost never happen, and if it occurs frequently then it '
+                'indicates that the Consul server cluster is unhealthy. This client will attempt to create a new '
+                'session.'
+            )
+            reactor.callLater(self.SESSION_CREATE_RETRY_DELAY_SECONDS, self.create)
+        else:
+            # Since the session is valid, just go back to watching.
+            reactor.callLater(0, self.watch_for_session_change, index=index)
+
+    @defer.inlineCallbacks
     def renew(self):
         """Renew session if one is active, else do nothing."""
         try:
             if self.uuid is not None:
                 self.logger.trace('name=%s session=%s renewing session', self.name, self.uuid)
                 yield self.base.renew(self.uuid)
+        except NotFound:
+            self.logger.warning('Session %s renew failure: not found.', self.uuid)
         except ConsulException as e:
             self.logger.warning(
                 'session=%s renewal attempt failed reason=%s',
