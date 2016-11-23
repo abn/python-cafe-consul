@@ -21,7 +21,7 @@ class ConsulSessionWrapper(LoggedObject, ConsulBase.Session):
         self.ttl = ttl or self.SESSION_TTL_SECONDS
         self.heartbeat_interval = heartbeat_interval or self.SESSION_HEARTBEAT_SECONDS
         self.lock_delay = lock_delay or self.SESSION_LOCK_DELAY_SECONDS
-        if self.lock_delay is not None and 0 > self.lock_delay > 60:
+        if self.lock_delay is not None and 0 < self.lock_delay < 60:
             self.logger.debug('invalid lock-delay=%s specified, using defaults', self.lock_delay)
             self.lock_delay = 15
         self.heartbeat = task.LoopingCall(self.renew)
