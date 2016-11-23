@@ -116,7 +116,7 @@ class DistributedConsulAgent(SessionedConsulAgent):
 
     @defer.inlineCallbacks
     def update_leader(self, index=None, sleep_on_error=True):
-        if self.is_leader and (self.session.uuid is None or self.session.uud != self.leader):
+        if self.is_leader and (self.session.uuid is None or self.session.uuid != self.leader):
             # reset leader flag if the session uuid has changed
             self.is_leader = False
 
