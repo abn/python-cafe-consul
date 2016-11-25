@@ -1,5 +1,5 @@
 from abc import abstractmethod
-from twisted.internet import defer
+from twisted.internet import defer, reactor
 
 from cafe.abc import AbstractClass
 from cafe.logging import LoggedObject
@@ -25,7 +25,7 @@ class ConsulLockContext(LoggedObject, object):
         return self.lock.key
 
     def set_release_kwarg(self, **kwargs):
-        self.release_kwargs.update(other=kwargs)
+        self.release_kwargs.update(**kwargs)
 
     @defer.inlineCallbacks
     def __enter__(self):
@@ -37,9 +37,14 @@ class ConsulLockContext(LoggedObject, object):
             raise ConsulLockFailed(self.lock.key)
         defer.returnValue(self)
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    @defer.inlineCallbacks
+    def release(self):
         if self.locked:
-            self.lock.release(delete=self.delete, **self.release_kwargs)
+            yield self.lock.release(delete=self.delete, **self.release_kwargs)
+            self.locked = False
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        reactor.callLater(0, self.release)
         super(ConsulLockContext, self).__exit__(exc_type, exc_val, exc_tb)
 
 
