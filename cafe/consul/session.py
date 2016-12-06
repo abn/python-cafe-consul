@@ -127,7 +127,7 @@ class ConsulSessionWrapper(LoggedObject, ConsulBase.Session):
             self.logger.trace('name=%s session=%s fetch info', self.name, self.uuid)
             index, session = yield self.base.info(self.uuid, index=index, consistency='consistent')
         except ConsulException as e:
-            self.logger.debug(
+            self.logger.warn(
                 'name=%s session=%s fetch info failed, retrying later reason=%s', self.name, self.uuid, e.message)
             # since something went wrong with the query to consul, wait for a bit before retrying
             reactor.callLater(self.SESSION_CREATE_RETRY_DELAY_SECONDS, self.watch_for_session_change, index=index)
