@@ -1,3 +1,4 @@
+from json import dumps
 from os import getenv
 from time import time
 from twisted.internet import task, reactor, defer
@@ -90,8 +91,12 @@ class ConsulSessionWrapper(LoggedObject, ConsulBase.Session):
         :type force: bool
         :rtype: bool
         """
+        self.logger.trace('name=%s session=%s session recreate requested', self.name, self.uuid)
         if self.uuid is not None and not force and self.life > 0:
-            self.logger.debug('name=%s session=%s session recreate requested but not forced, skipping as life is not 0')
+            self.logger.debug(
+                'name=%s session=%s session recreate requested but not forced, skipping as life is not 0',
+                self.name, self.uuid
+            )
             defer.returnValue(False)
         yield self.destroy()
         created = yield self.create(retry=retry)
@@ -114,16 +119,29 @@ class ConsulSessionWrapper(LoggedObject, ConsulBase.Session):
         :type index: int
         :rtype: None
         """
-        index, session = yield self.base.info(self._uuid, index=index)
-        if not session:
-            self.logger.warning(
-                'The Consul session is missing. This should almost never happen, and if it occurs frequently then it '
-                'indicates that the Consul server cluster is unhealthy. This client will attempt to create a new '
-                'session.'
-            )
-            reactor.callLater(0, self.recreate, force=True)
+        if self.uuid is None:
+            self.logger.debug('name=%s session not set, discontinuing watch on session')
+            defer.returnValue(None)
+
+        try:
+            self.logger.trace('name=%s session=%s fetch info', self.name, self.uuid)
+            index, session = yield self.base.info(self.uuid, index=index, consistency='consistent')
+        except ConsulException as e:
+            self.logger.debug(
+                'name=%s session=%s fetch info failed, retrying later reason=%s', self.name, self.uuid, e.message)
+            # since something went wrong with the query to consul, wait for a bit before retrying
+            reactor.callLater(self.SESSION_CREATE_RETRY_DELAY_SECONDS, self.watch_for_session_change, index=index)
         else:
-            # Since the session is valid, just go back to watching.
+            if self.uuid is not None and session is None:
+                self.logger.warning(
+                    'The Consul session is missing. This should almost never happen, and if it occurs frequently then '
+                    'it indicates that the Consul server cluster is unhealthy. This client will attempt to create a '
+                    'new session.'
+                )
+                reactor.callLater(0, self.recreate, force=True)
+                defer.returnValue(None)
+            self.logger.trace('name=%s session=%s info=%s', self.name, self.uuid, dumps(session, indent=2))
+            # Since the session is valid, just go back to watching immediately
             reactor.callLater(0, self.watch_for_session_change, index=index)
 
     @defer.inlineCallbacks
