@@ -11,6 +11,7 @@ from consul.base import Consul as ConsulBase, NotFound
 
 # noinspection PyMethodOverriding
 class ConsulSessionWrapper(LoggedObject, ConsulBase.Session):
+    SESSION_READ_CONSISTENCY = getenv('SESSION_READ_CONSISTENCY', None)
     SESSION_TTL_SECONDS = int(getenv('CONSUL_SESSION_TTL_SECONDS', '75'))
     SESSION_HEARTBEAT_SECONDS = int(getenv('CONSUL_SESSION_HEARTBEAT_SECONDS', '75'))
     SESSION_LOCK_DELAY_SECONDS = int(getenv('CONSUL_SESSION_LOCK_DELAY_SECONDS', '15'))
@@ -125,7 +126,7 @@ class ConsulSessionWrapper(LoggedObject, ConsulBase.Session):
 
         try:
             self.logger.trace('name=%s session=%s fetch info', self.name, self.uuid)
-            index, session = yield self.base.info(self.uuid, index=index, consistency='consistent')
+            index, session = yield self.base.info(self.uuid, index=index, consistency=self.SESSION_READ_CONSISTENCY)
         except ConsulException as e:
             self.logger.warn(
                 'name=%s session=%s fetch info failed, retrying later reason=%s', self.name, self.uuid, e.message)
