@@ -30,7 +30,7 @@ with open(path.join(base_dir, 'README.rst')) as f:
 install_requires = extract_requirements('requirements.txt')
 
 setup(
-    name='cafe-consul',
+    name='python-cafe-consul',
     version='0.12.0-dev',
     description='Asynchronous Consul extension for Cafe',
     long_description=long_description,
