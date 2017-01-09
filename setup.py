@@ -31,7 +31,7 @@ install_requires = extract_requirements('requirements.txt')
 
 setup(
     name='python-cafe-consul',
-    version='0.12.0',
+    version='0.12.1-dev',
     description='Asynchronous Consul extension for Cafe',
     long_description=long_description,
     license='APLv2',
